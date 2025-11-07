@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>GE5219 - Real-time Dengue Risk Map for Singapore</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+
+    <style>
+        /* ===== 全局字体与布局设置 ===== */
+        html, body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                         "Helvetica Neue", Arial, sans-serif;
+            background: #f5f5f5;
+        }
+
+        #map {
+            height: 100vh;
+            width: 100%;
+        }
+
+        /* 顶部标题栏 */
+        .top-bar {
+            position: absolute;
+            top: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.92);
+            padding: 8px 16px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .top-bar-title {
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        .top-bar-subtitle {
+            font-size: 13px;
+            color: #666;
+        }
+
+        /* 信息面板样式 */
+        .info.leaflet-control {
+            padding: 8px 10px;
+            font-size: 13px;
+            background: rgba(255,255,255,0.95);
+            box-shadow: 0 0 15px rgba(0,0,0,0.2);
+            border-radius: 8px;
+            line-height: 1.4;
+        }
+
+        .info h4 {
+            margin: 0 0 4px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        /* 勾选项区域 */
+        .info-options {
+            margin-top: 4px;
+            margin-bottom: 4px;
+        }
+
+        .info-options-row {
+            display: block;
+            margin-bottom: 2px;
+        }
+
+        .info-options-row label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+        }
+
+        .info-options-row input[type="checkbox"] {
+            margin: 0;
+        }
+
+        .info-details {
+            margin-top: 4px;
+        }
+
+        /* 图例样式（右下角） */
+        .legend {
+            line-height: 18px;
+            color: #555;
+        }
+        .legend h4 {
+            margin: 0 0 4px;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .legend i {
+            width: 14px;
+            height: 14px;
+            float: left;
+            margin-right: 8px;
+            margin-top: 2px;
+            opacity: 0.8;
+            border-radius: 3px;
+        }
+
+        /* 左下角数据来源说明 */
+        .source-note.leaflet-control {
+            padding: 6px 8px;
+            font-size: 11px;
+            background: rgba(255,255,255,0.9);
+            border-radius: 6px;
+        }
+        
+        /* 重置视图按钮样式 */
+        .leaflet-control-home a {
+            background-image: url('data:image/svg+xml;charset=utf-8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="%23333"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8h5z"/></svg>');
+            background-size: 18px 18px;
+            background-position: center;
+            background-repeat: no-repeat;
+            width: 30px;
+            height: 30px;
+            display: block;
+            border-radius: 4px;
+        }
+        .leaflet-control-home a:hover {
+            background-color: #f4f4f4;
+        }
+
+        /* 鼠标移到 polygon 上变小手，提示可交互 */
+        .leaflet-interactive {
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+<div class="top-bar">
+    <div class="top-bar-title">GE5219 – Real-time Dengue Risk Map for Singapore</div>
+    <div class="top-bar-subtitle" id="update-time">Last update: loading…</div>
+</div>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+<script>
+    // ============================================================
+    // 全局常量与变量
+    // ============================================================
+
+    const GEOJSON_FILE = 'sg_subz_res_wgs84.geojson';
+    const SG_CENTER = [1.3521, 103.8198];
+    const SG_ZOOM = 11;
+
+    // 恢复原来的分级
+    const RISK_BREAKS = [0, 0.1, 0.2, 0.4, 0.6, 0.8];
+
+    let currentProps = null;
+    let geojsonLayer = null;
+
+    const map = L.map('map').setView(SG_CENTER, SG_ZOOM);
+
+    // ============================================================
+    // 底图图层
+    // ============================================================
+
+    const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '© OpenStreetMap contributors'
+    });
+
+    const darkMap = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        maxZoom: 19,
+        attribution: '© OpenStreetMap contributors, © CartoDB'
+    });
+
+    osm.addTo(map);
+
+    // ============================================================
+    // 颜色与样式（基于 dengue_coefficient）
+    // ============================================================
+
+    // 标准底图配色：黄 -> 橙 -> 红（沿用之前的逻辑，只是对应 break）
+    function getColorRisk(d) {
+        return d > 0.8 ? '#800026' :
+               d > 0.6 ? '#BD0026' :
+               d > 0.4 ? '#E31A1C' :
+               d > 0.2 ? '#FC4E2A' :
+               d > 0.1 ? '#FD8D3C' :
+                         '#FFEDA0';
+    }
+
+    // Dark 底图下更亮一点的蓝色配色（只换颜色，不改分级）
+    function getColorBlue(d) {
+        return d > 0.8 ? '#0B3C5D' :   // 深蓝
+               d > 0.6 ? '#186BB3' :   // 亮一点的蓝
+               d > 0.4 ? '#2A9DF4' :   // 高亮蓝
+               d > 0.2 ? '#7FC8FF' :   // 浅蓝
+               d > 0.1 ? '#B9E3FF' :   // very light
+                         '#E6F4FF';    // almost white blue
+    }
+
+    let currentColorFunction = getColorRisk;
+
+    function style(feature) {
+        const riskScore = feature.properties.dengue_coefficient || 0;
+        return {
+            fillColor: currentColorFunction(riskScore),
+            weight: 1,
+            opacity: 1,
+            color: 'white',
+            dashArray: '3',
+            fillOpacity: 0.75
+        };
+    }
+
+    // ============================================================
+    // 重置视图按钮
+    // ============================================================
+
+    const HomeControl = L.Control.extend({
+        options: {
+            position: 'topleft',
+            title: 'Reset view'
+        },
+        onAdd: function(map) {
+            const container = L.DomUtil.create('div', 'leaflet-bar leaflet-control leaflet-control-home');
+            const link = L.DomUtil.create('a', '', container);
+            link.href = '#';
+            link.title = this.options.title;
+            
+            L.DomEvent.on(link, 'click', L.DomEvent.stop)
+                      .on(link, 'click', () => {
+                          map.setView(SG_CENTER, SG_ZOOM);
+                      });
+
+            return container;
+        },
+        onRemove: function(map) {}
+    });
+    new HomeControl().addTo(map);
+
+    // ============================================================
+    // 右上角：勾选框面板（固定在上）
+    // ============================================================
+
+    const varsPanel = L.control({position: 'topright'});
+    varsPanel.onAdd = function (map) {
+        const div = L.DomUtil.create('div', 'info');
+
+        div.innerHTML = `
+            <h4>Subzone dengue risk</h4>
+            <div style="font-size:12px; margin-bottom:4px;">
+                Select variables to display:
+            </div>
+            <div class="info-options">
+                <div class="info-options-row">
+                    <label>
+                        <input type="checkbox" id="select-all-variables">
+                        <b>Select all</b>
+                    </label>
+                </div>
+                <div class="info-options-row">
+                    <label>
+                        <input type="checkbox" data-field="CASE_SIZE" data-label="Active cases" checked>
+                        Active cases
+                    </label>
+                </div>
+                <div class="info-options-row">
+                    <label>
+                        <input type="checkbox" data-field="temp" data-label="Air temperature (°C)" checked>
+                        Air temperature (°C)
+                    </label>
+                </div>
+                <div class="info-options-row">
+                    <label>
+                        <input type="checkbox" data-field="rain" data-label="Rainfall (mm)" checked>
+                        Rainfall (mm)
+                    </label>
+                </div>
+                <div class="info-options-row">
+                    <label>
+                        <input type="checkbox" data-field="pop_den" data-label="Population density" checked>
+                        Population density
+                    </label>
+                </div>
+                <div class="info-options-row">
+                    <label>
+                        <input type="checkbox" data-field="ndvi" data-label="NDVI" checked>
+                        NDVI
+                    </label>
+                </div>
+            </div>
+        `;
+
+        L.DomEvent.disableClickPropagation(div);
+
+        const selectAllCb = div.querySelector('#select-all-variables');
+        const varCbs = div.querySelectorAll('.info-options input[type="checkbox"][data-field]');
+
+        function updateSelectAllState() {
+            const total = varCbs.length;
+            let checkedCount = 0;
+            varCbs.forEach(cb => {
+                if (cb.checked) checkedCount++;
+            });
+
+            if (checkedCount === 0) {
+                selectAllCb.checked = false;
+                selectAllCb.indeterminate = false;
+            } else if (checkedCount === total) {
+                selectAllCb.checked = true;
+                selectAllCb.indeterminate = false;
+            } else {
+                selectAllCb.checked = false;
+                selectAllCb.indeterminate = true;
+            }
+        }
+
+        updateSelectAllState();
+
+        selectAllCb.addEventListener('change', () => {
+            const checked = selectAllCb.checked;
+            selectAllCb.indeterminate = false;
+            varCbs.forEach(cb => {
+                cb.checked = checked;
+            });
+            detailsPanel.update(currentProps);
+        });
+
+        varCbs.forEach(cb => {
+            cb.addEventListener('change', () => {
+                updateSelectAllState();
+                detailsPanel.update(currentProps);
+            });
+        });
+
+        return div;
+    };
+    varsPanel.addTo(map);
+
+    // ============================================================
+    // 右上角：详情面板（在勾选框下面）
+    // ============================================================
+
+    const detailsPanel = L.control({position: 'topright'});
+    detailsPanel.onAdd = function (map) {
+        this._div = L.DomUtil.create('div', 'info');
+        this._div.innerHTML = 'Hover over a subzone';
+        L.DomEvent.disableClickPropagation(this._div);
+        return this._div;
+    };
+
+    detailsPanel.update = function(props) {
+        if (!this._div) return;
+        const div = this._div;
+
+        if (!props) {
+            div.innerHTML = 'Hover over a subzone';
+            return;
+        }
+
+        let html = '';
+        const name = props.subzone || 'Unknown subzone';
+        const riskVal = (props.dengue_coefficient != null && !Number.isNaN(props.dengue_coefficient))
+            ? props.dengue_coefficient.toFixed(3)
+            : 'N/A';
+
+        html += `<b>${name}</b><br/>`;
+        html += `Risk coefficient: <b>${riskVal}</b><br/>`;
+
+        const checkboxes = document.querySelectorAll('.info-options input[type="checkbox"][data-field]');
+        checkboxes.forEach(cb => {
+            if (!cb.checked) return;
+            const field = cb.getAttribute('data-field');
+            const label = cb.getAttribute('data-label');
+            let value = props[field];
+
+            if (value == null || Number.isNaN(value)) {
+                value = 'N/A';
+            } else if (typeof value === 'number') {
+                if (field === 'CASE_SIZE' || field === 'pop_den') {
+                    value = value.toFixed(0);
+                } else {
+                    value = value.toFixed(3);
+                }
+            }
+
+            html += `${label}: ${value}<br/>`;
+        });
+
+        div.innerHTML = html;
+    };
+
+    detailsPanel.addTo(map);
+
+    // ============================================================
+    // 交互事件
+    // ============================================================
+
+    function highlightFeature(e) {
+        const layer = e.target;
+
+        layer.setStyle({
+            weight: 2,
+            color: '#666',
+            dashArray: '',
+            fillOpacity: 0.9
+        });
+
+        if (!L.Browser.ie && !L.Browser.opera && !L.Browser.edge) {
+            layer.bringToFront();
+        }
+
+        currentProps = layer.feature.properties;
+        detailsPanel.update(currentProps);
+    }
+
+    function resetHighlight(e) {
+        if (geojsonLayer) {
+            geojsonLayer.resetStyle(e.target);
+        }
+        currentProps = null;
+        detailsPanel.update(null);
+    }
+
+    function zoomToFeature(e) {
+        map.fitBounds(e.target.getBounds());
+    }
+
+    function onEachFeature(feature, layer) {
+        layer.on({
+            mouseover: highlightFeature,
+            mouseout: resetHighlight,
+            click: zoomToFeature
+        });
+
+        const risk = feature.properties.dengue_coefficient;
+        layer.bindPopup(
+            '<b>' + (feature.properties.subzone || 'Unknown subzone') + '</b><br/>' +
+            'Risk coefficient: ' + (risk != null && !Number.isNaN(risk) ? risk.toFixed(3) : 'N/A')
+        );
+    }
+
+    // ============================================================
+    // 加载 GeoJSON 数据
+    // ============================================================
+
+    fetch(GEOJSON_FILE)
+        .then(response => {
+            if (!response.ok) {
+                throw new Error('Cannot load file: ' + GEOJSON_FILE);
+            }
+            return response.json();
+        })
+        .then(data => {
+            geojsonLayer = L.geoJSON(data, {
+                style: style,
+                onEachFeature: onEachFeature
+            }).addTo(map);
+
+            map.fitBounds(geojsonLayer.getBounds());
+
+            if (data.features && data.features.length > 0) {
+                const t = data.features[0].properties.time;
+                const timeEl = document.getElementById('update-time');
+                if (t && timeEl) {
+                    timeEl.textContent = 'Last update: ' + t;
+                }
+            }
+
+            const baseMaps = {
+                "Standard": osm,
+                "Dark": darkMap
+            };
+
+            const overlayMaps = {
+                "Dengue Risk Layer": geojsonLayer
+            };
+
+            // 图层控制器放在左下角（后面我们再把 data 框和比例尺也放左下）
+            L.control.layers(baseMaps, overlayMaps, { position: 'bottomleft' }).addTo(map);
+        })
+        .catch(error => {
+            console.error('Failed to load GeoJSON:', error);
+            alert('Map loading failed: ' + error.message);
+        });
+
+    // ============================================================
+    // 图例（右下角）- 动态更新
+    // ============================================================
+
+    const legend = L.control({ position: 'bottomright' });
+
+    legend.onAdd = function (map) {
+        this._div = L.DomUtil.create('div', 'info legend');
+        this.update();
+        return this._div;
+    };
+
+    legend.update = function () {
+        if (!this._div) return;
+
+        const grades = RISK_BREAKS;
+        let labels = [];
+        let html = '<h4>Dengue risk coefficient</h4>';
+
+        for (let i = 0; i < grades.length; i++) {
+            const from = grades[i];
+            const to = grades[i + 1];
+
+            labels.push(
+                '<i style="background:' + currentColorFunction(from + 0.0001) + '"></i> ' +
+                from.toFixed(1) + (to ? '&ndash;' + to.toFixed(1) : '+')
+            );
+        }
+
+        html += labels.join('<br>');
+        this._div.innerHTML = html;
+    };
+
+    legend.addTo(map);
+
+    // ============================================================
+    // 左下角数据来源说明（在图层控制器下面）
+    // ============================================================
+
+    const sourceNote = L.control({ position: 'bottomleft' });
+
+    sourceNote.onAdd = function (map) {
+        const div = L.DomUtil.create('div', 'source-note');
+        div.innerHTML =
+            'Data: MOH / NEA; rainfall & temperature from data.gov.sg<br/>' +
+            'Risk score aggregated at subzone level';
+        return div;
+    };
+
+    sourceNote.addTo(map);
+
+    // ============================================================
+    // 底图切换事件：切换色带 + 刷新图例和样式
+    // ============================================================
+
+    map.on('baselayerchange', (e) => {
+        if (e.name === 'Dark') {
+            currentColorFunction = getColorBlue;
+        } else {
+            currentColorFunction = getColorRisk;
+        }
+
+        if (geojsonLayer) {
+            geojsonLayer.setStyle(style);
+        }
+
+        legend.update();
+    });
+
+    // ============================================================
+    // 比例尺（左下角，位于 data 框下面）
+    // ============================================================
+
+    L.control.scale({
+        position: 'bottomleft',
+        metric: true,
+        imperial: false
+    }).addTo(map);
+
+</script>
+
+</body>
+</html>
