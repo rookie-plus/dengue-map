@@ -8,7 +8,6 @@
     <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
 
     <style>
-        /* ===== 全局字体与布局设置 ===== */
         html, body {
             height: 100%;
             margin: 0;
@@ -23,7 +22,6 @@
             width: 100%;
         }
 
-        /* 顶部标题栏 */
         .top-bar {
             position: absolute;
             top: 10px;
@@ -55,7 +53,6 @@
             color: #888;
         }
 
-        /* 信息面板样式 */
         .info.leaflet-control {
             padding: 8px 10px;
             font-size: 13px;
@@ -71,7 +68,6 @@
             font-weight: 600;
         }
 
-        /* 勾选项区域 */
         .info-options {
             margin-top: 4px;
             margin-bottom: 4px;
@@ -93,11 +89,6 @@
             margin: 0;
         }
 
-        .info-details {
-            margin-top: 4px;
-        }
-
-        /* 图例样式（右下角） */
         .legend {
             line-height: 18px;
             color: #555;
@@ -117,7 +108,6 @@
             border-radius: 3px;
         }
 
-        /* 左下角数据来源说明 */
         .source-note.leaflet-control {
             padding: 6px 8px;
             font-size: 11px;
@@ -125,7 +115,6 @@
             border-radius: 6px;
         }
         
-        /* 重置视图按钮样式 */
         .leaflet-control-home a {
             background-image: url('data:image/svg+xml;charset=utf-8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="%23333"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8h5z"/></svg>');
             background-size: 18px 18px;
@@ -140,9 +129,32 @@
             background-color: #f4f4f4;
         }
 
-        /* 鼠标移到 polygon 上变小手，提示可交互 */
         .leaflet-interactive {
             cursor: pointer;
+        }
+
+        /* 右下角变量对比框（放在 legend 上方） */
+        .compare-box {
+            margin-bottom: 6px;
+            font-size: 12px;
+        }
+        .compare-box b {
+            font-size: 13px;
+        }
+        .compare-box table {
+            margin-top: 4px;
+            font-size: 11px;
+            border-collapse: collapse;
+        }
+        .compare-box th,
+        .compare-box td {
+            padding: 2px 6px;
+            text-align: center;
+            white-space: nowrap;
+            border-bottom: 1px solid #eee;
+        }
+        .compare-box th {
+            font-weight: 600;
         }
     </style>
 </head>
@@ -167,11 +179,16 @@
     const SG_CENTER = [1.3521, 103.8198];
     const SG_ZOOM = 11;
 
-    // 恢复原来的分级
     const RISK_BREAKS = [0, 0.1, 0.2, 0.4, 0.6, 0.8];
 
     let currentProps = null;
-    let geojsonLayer = null;
+    let riskLayer = null;
+    let casesLayer = null;
+
+    // 病例自然间断点（Jenks），4 级 -> 长度 5 的数组 [min, b1, b2, b3, max]
+    let CASE_BREAKS = [];
+    // 图例当前模式：'risk' 或 'cases'
+    let legendMode = 'risk';
 
     const map = L.map('map').setView(SG_CENTER, SG_ZOOM);
 
@@ -192,10 +209,9 @@
     osm.addTo(map);
 
     // ============================================================
-    // 颜色与样式（基于 dengue_coefficient）
+    // 颜色与样式：风险系数
     // ============================================================
 
-    // 标准底图配色：黄 -> 橙 -> 红（沿用之前的逻辑，只是对应 break）
     function getColorRisk(d) {
         return d > 0.8 ? '#800026' :
                d > 0.6 ? '#BD0026' :
@@ -205,14 +221,13 @@
                          '#FFEDA0';
     }
 
-    // Dark 底图下更亮一点的蓝色配色（只换颜色，不改分级）
     function getColorBlue(d) {
-        return d > 0.8 ? '#0B3C5D' :   // 深蓝
-               d > 0.6 ? '#186BB3' :   // 亮一点的蓝
-               d > 0.4 ? '#2A9DF4' :   // 高亮蓝
-               d > 0.2 ? '#7FC8FF' :   // 浅蓝
-               d > 0.1 ? '#B9E3FF' :   // very light
-                         '#E6F4FF';    // almost white blue
+        return d > 0.8 ? '#0B3C5D' :
+               d > 0.6 ? '#186BB3' :
+               d > 0.4 ? '#2A9DF4' :
+               d > 0.2 ? '#7FC8FF' :
+               d > 0.1 ? '#B9E3FF' :
+                         '#E6F4FF';
     }
 
     let currentColorFunction = getColorRisk;
@@ -230,14 +245,145 @@
     }
 
     // ============================================================
+    // 病例图层配色：自然间断点 + 不同底图配色
+    // ============================================================
+
+    const CASE_COLORS_LIGHT = ['#f2f0f7', '#cbc9e2', '#9e9ac8', '#6a51a3']; // Standard 紫色
+    const CASE_COLORS_DARK  = ['#f7fcf5', '#c7e9c0', '#41ab5d', '#006d2c']; // Dark 绿色
+
+    // 病例颜色（根据 Jenks breaks + 0 case 单独白色）
+    function getCasesColorFromBreaks(d, palette) {
+        if (d == null || isNaN(d)) {
+            return '#ffffff';  // 没有数据也白色
+        }
+        if (d === 0) {
+            return '#ffffff';  // ✅ 0 个病例：纯白，不透明
+        }
+
+        if (!CASE_BREAKS || CASE_BREAKS.length < 2) {
+            return '#cccccc';
+        }
+        if (d <= CASE_BREAKS[1]) return palette[0];
+        if (d <= CASE_BREAKS[2]) return palette[1];
+        if (d <= CASE_BREAKS[3]) return palette[2];
+        return palette[3];
+    }
+
+    function getCasesColorLight(d) {
+        return getCasesColorFromBreaks(d, CASE_COLORS_LIGHT);
+    }
+
+    function getCasesColorDark(d) {
+        return getCasesColorFromBreaks(d, CASE_COLORS_DARK);
+    }
+
+    let currentCasesColorFunction = getCasesColorLight;
+
+    function styleCases(feature) {
+        const cases = feature.properties.CASE_SIZE || 0;
+
+        return {
+            fillColor: currentCasesColorFunction(cases),
+            weight: 1,          // 不再根据是否为 0 改变粗细
+            opacity: 1,
+            color: '#e1e1e0',      // 统一边线颜色
+            dashArray: '3',
+            fillOpacity: 0.8    // ✅ 所有区域都实心、不再“透明”
+        };
+    }
+
+    // ============================================================
+    // Jenks 自然间断点算法（4 级）
+    // ============================================================
+
+    function jenks(data, n_classes) {
+        // 拷贝并排序
+        data = data.slice().sort((a, b) => a - b);
+        const n_data = data.length;
+        if (n_classes > n_data) n_classes = n_data;
+
+        const mat1 = Array(n_data + 1).fill(0).map(() => Array(n_classes + 1).fill(0));
+        const mat2 = Array(n_data + 1).fill(0).map(() => Array(n_classes + 1).fill(0));
+
+        for (let i = 1; i <= n_classes; i++) {
+            mat1[0][i] = 1;
+            mat2[0][i] = 0;
+            for (let j = 1; j <= n_data; j++) {
+                mat2[j][i] = Infinity;
+            }
+        }
+
+        let v = 0.0;
+
+        for (let l = 2; l <= n_data; l++) {
+            let s1 = 0.0;
+            let s2 = 0.0;
+            let w = 0;
+
+            for (let m = 1; m <= l; m++) {
+                const lowerClassLimit = l - m + 1;
+                const val = data[lowerClassLimit - 1];
+
+                s2 += val * val;
+                s1 += val;
+                w++;
+
+                v = s2 - (s1 * s1) / w;
+
+                const i4 = lowerClassLimit - 1;
+                if (i4 !== 0) {
+                    for (let j = 2; j <= n_classes; j++) {
+                        if (mat2[l][j] >= (v + mat2[i4][j - 1])) {
+                            mat1[l][j] = lowerClassLimit;
+                            mat2[l][j] = v + mat2[i4][j - 1];
+                        }
+                    }
+                }
+            }
+
+            mat1[l][1] = 1;
+            mat2[l][1] = v;
+        }
+
+        const kclass = Array(n_classes + 1).fill(0);
+        kclass[n_classes] = data[n_data - 1];
+        kclass[0] = data[0];
+
+        let k = n_data;
+        for (let j = n_classes; j >= 2; j--) {
+            const id = mat1[k][j] - 2;
+            kclass[j - 1] = data[id];
+            k = mat1[k][j] - 1;
+        }
+
+        return kclass;
+    }
+
+    function computeCaseBreaks(data) {
+        const values = [];
+        data.features.forEach(f => {
+            const v = f.properties.CASE_SIZE;
+            if (v != null && !isNaN(v) && v >= 0) {
+                values.push(v);
+            }
+        });
+
+        if (values.length === 0) {
+            CASE_BREAKS = [];
+            return;
+        }
+
+        const nClasses = Math.min(4, values.length);
+        CASE_BREAKS = jenks(values, nClasses);
+        // console.log('CASE_BREAKS', CASE_BREAKS);
+    }
+
+    // ============================================================
     // 重置视图按钮
     // ============================================================
 
     const HomeControl = L.Control.extend({
-        options: {
-            position: 'topleft',
-            title: 'Reset view'
-        },
+        options: { position: 'topleft', title: 'Reset view' },
         onAdd: function(map) {
             const container = L.DomUtil.create('div', 'leaflet-bar leaflet-control leaflet-control-home');
             const link = L.DomUtil.create('a', '', container);
@@ -256,7 +402,7 @@
     new HomeControl().addTo(map);
 
     // ============================================================
-    // 右上角：勾选框面板（固定在上）
+    // 右上角：变量勾选
     // ============================================================
 
     const varsPanel = L.control({position: 'topright'});
@@ -316,9 +462,7 @@
         function updateSelectAllState() {
             const total = varCbs.length;
             let checkedCount = 0;
-            varCbs.forEach(cb => {
-                if (cb.checked) checkedCount++;
-            });
+            varCbs.forEach(cb => { if (cb.checked) checkedCount++; });
 
             if (checkedCount === 0) {
                 selectAllCb.checked = false;
@@ -337,16 +481,16 @@
         selectAllCb.addEventListener('change', () => {
             const checked = selectAllCb.checked;
             selectAllCb.indeterminate = false;
-            varCbs.forEach(cb => {
-                cb.checked = checked;
-            });
+            varCbs.forEach(cb => { cb.checked = checked; });
             detailsPanel.update(currentProps);
+            compareBox.update(currentProps);
         });
 
         varCbs.forEach(cb => {
             cb.addEventListener('change', () => {
                 updateSelectAllState();
                 detailsPanel.update(currentProps);
+                compareBox.update(currentProps);
             });
         });
 
@@ -355,7 +499,7 @@
     varsPanel.addTo(map);
 
     // ============================================================
-    // 右上角：详情面板（在勾选框下面）
+    // 右上角详情面板
     // ============================================================
 
     const detailsPanel = L.control({position: 'topright'});
@@ -410,6 +554,72 @@
     detailsPanel.addTo(map);
 
     // ============================================================
+    // 右下角 Risk vs Active cases 对比框
+    // ============================================================
+
+    const compareBox = L.control({ position: 'bottomright' });
+
+    compareBox.onAdd = function (map) {
+        this._div = L.DomUtil.create('div', 'info compare-box');
+        this._div.style.display = 'none';
+        this.update(null);
+        L.DomEvent.disableClickPropagation(this._div);
+        return this._div;
+    };
+
+    compareBox.update = function (props) {
+        if (!this._div) return;
+
+        const activeCasesCb = document.querySelector('.info-options input[data-field="CASE_SIZE"]');
+
+        if (!activeCasesCb || !activeCasesCb.checked) {
+            this._div.style.display = 'none';
+            this._div.innerHTML = '';
+            return;
+        }
+
+        this._div.style.display = 'block';
+
+        if (!props) {
+            this._div.innerHTML =
+                '<b>Risk vs Active cases</b><br/>' +
+                '<span style="font-size:11px;color:#666;">Hover over a subzone to compare.</span>';
+            return;
+        }
+
+        const name = props.subzone || 'This subzone';
+        let riskVal = props.dengue_coefficient;
+        let caseVal = props.CASE_SIZE;
+
+        if (riskVal == null || Number.isNaN(riskVal)) {
+            riskVal = 'N/A';
+        } else {
+            riskVal = riskVal.toFixed(3);
+        }
+
+        if (caseVal == null || Number.isNaN(caseVal)) {
+            caseVal = 'N/A';
+        } else {
+            caseVal = caseVal.toFixed(0);
+        }
+
+        this._div.innerHTML = `
+            <b>Risk vs Active cases</b><br/>
+            <span style="font-size:12px;">${name}</span>
+            <table>
+                <tr>
+                    <th>Risk coefficient</th>
+                    <th>Active cases</th>
+                </tr>
+                <tr>
+                    <td>${riskVal}</td>
+                    <td>${caseVal}</td>
+                </tr>
+            </table>
+        `;
+    };
+
+    // ============================================================
     // 交互事件
     // ============================================================
 
@@ -429,14 +639,21 @@
 
         currentProps = layer.feature.properties;
         detailsPanel.update(currentProps);
+        compareBox.update(currentProps);
     }
 
     function resetHighlight(e) {
-        if (geojsonLayer) {
-            geojsonLayer.resetStyle(e.target);
+        const layer = e.target;
+
+        if (riskLayer && riskLayer.hasLayer(layer)) {
+            riskLayer.resetStyle(layer);
+        } else if (casesLayer && casesLayer.hasLayer(layer)) {
+            casesLayer.resetStyle(layer);
         }
+
         currentProps = null;
         detailsPanel.update(null);
+        compareBox.update(null);
     }
 
     function zoomToFeature(e) {
@@ -451,9 +668,11 @@
         });
 
         const risk = feature.properties.dengue_coefficient;
+        const cases = feature.properties.CASE_SIZE;
         layer.bindPopup(
             '<b>' + (feature.properties.subzone || 'Unknown subzone') + '</b><br/>' +
-            'Risk coefficient: ' + (risk != null && !Number.isNaN(risk) ? risk.toFixed(3) : 'N/A')
+            'Risk coefficient: ' + (risk != null && !Number.isNaN(risk) ? risk.toFixed(3) : 'N/A') + '<br/>' +
+            'Active cases: ' + (cases != null && !Number.isNaN(cases) ? cases : 'N/A')
         );
     }
 
@@ -469,12 +688,22 @@
             return response.json();
         })
         .then(data => {
-            geojsonLayer = L.geoJSON(data, {
+            // 先计算病例自然间断点
+            computeCaseBreaks(data);
+
+            // 风险图层
+            riskLayer = L.geoJSON(data, {
                 style: style,
                 onEachFeature: onEachFeature
             }).addTo(map);
 
-            map.fitBounds(geojsonLayer.getBounds());
+            // 病例图层
+            casesLayer = L.geoJSON(data, {
+                style: styleCases,
+                onEachFeature: onEachFeature
+            });
+
+            map.fitBounds(riskLayer.getBounds());
 
             if (data.features && data.features.length > 0) {
                 const t = data.features[0].properties.time;
@@ -490,10 +719,10 @@
             };
 
             const overlayMaps = {
-                "Dengue Risk Layer": geojsonLayer
+                "Dengue risk": riskLayer,
+                "Real case distribution": casesLayer
             };
 
-            // 图层控制器放在左下角（后面我们再把 data 框和比例尺也放左下）
             L.control.layers(baseMaps, overlayMaps, { position: 'bottomleft' }).addTo(map);
         })
         .catch(error => {
@@ -502,7 +731,7 @@
         });
 
     // ============================================================
-    // 图例（右下角）- 动态更新
+    // 图例（右下角）：在风险 / 病例之间切换
     // ============================================================
 
     const legend = L.control({ position: 'bottomright' });
@@ -516,17 +745,45 @@
     legend.update = function () {
         if (!this._div) return;
 
-        const grades = RISK_BREAKS;
-        let labels = [];
-        let html = '<h4>Dengue risk coefficient</h4>';
+        // 风险图例
+        if (legendMode === 'risk') {
+            const grades = RISK_BREAKS;
+            let labels = [];
+            let html = '<h4>Dengue risk coefficient</h4>';
 
-        for (let i = 0; i < grades.length; i++) {
-            const from = grades[i];
-            const to = grades[i + 1];
+            for (let i = 0; i < grades.length; i++) {
+                const from = grades[i];
+                const to = grades[i + 1];
+
+                labels.push(
+                    '<i style="background:' + currentColorFunction(from + 0.0001) + '"></i> ' +
+                    from.toFixed(1) + (to ? '&ndash;' + to.toFixed(1) : '+')
+                );
+            }
+
+            html += labels.join('<br>');
+            this._div.innerHTML = html;
+            return;
+        }
+
+        // 病例图例（自然间断点）
+        if (!CASE_BREAKS || CASE_BREAKS.length < 2) {
+            this._div.innerHTML =
+                '<h4>Active cases</h4>' +
+                '<span style="font-size:11px;color:#666;">No case data.</span>';
+            return;
+        }
+
+        let labels = [];
+        let html = '<h4>Active cases (natural breaks)</h4>';
+
+        for (let i = 0; i < CASE_BREAKS.length - 1; i++) {
+            const from = CASE_BREAKS[i];
+            const to   = CASE_BREAKS[i + 1];
 
             labels.push(
-                '<i style="background:' + currentColorFunction(from + 0.0001) + '"></i> ' +
-                from.toFixed(1) + (to ? '&ndash;' + to.toFixed(1) : '+')
+                '<i style="background:' + currentCasesColorFunction(from + 0.0001) + '"></i> ' +
+                Math.round(from) + (to ? '&ndash;' + Math.round(to) : '+')
             );
         }
 
@@ -535,9 +792,10 @@
     };
 
     legend.addTo(map);
+    compareBox.addTo(map); // 在 legend 之后，显示在 legend 上方
 
     // ============================================================
-    // 左下角数据来源说明（在图层控制器下面）
+    // 左下角数据来源说明
     // ============================================================
 
     const sourceNote = L.control({ position: 'bottomleft' });
@@ -553,25 +811,50 @@
     sourceNote.addTo(map);
 
     // ============================================================
-    // 底图切换事件：切换色带 + 刷新图例和样式
+    // 底图切换：风险 & 病例颜色一起切
     // ============================================================
 
     map.on('baselayerchange', (e) => {
         if (e.name === 'Dark') {
             currentColorFunction = getColorBlue;
+            currentCasesColorFunction = getCasesColorDark;
         } else {
             currentColorFunction = getColorRisk;
+            currentCasesColorFunction = getCasesColorLight;
         }
 
-        if (geojsonLayer) {
-            geojsonLayer.setStyle(style);
-        }
+        if (riskLayer) riskLayer.setStyle(style);
+        if (casesLayer) casesLayer.setStyle(styleCases);
 
         legend.update();
     });
 
     // ============================================================
-    // 比例尺（左下角，位于 data 框下面）
+    // overlay 切换：控制图例模式 risk / cases
+    // ============================================================
+
+    map.on('overlayadd', function(e) {
+        if (e.layer === casesLayer) {
+            legendMode = 'cases';
+            legend.update();
+        } else if (e.layer === riskLayer) {
+            legendMode = 'risk';
+            legend.update();
+        }
+    });
+
+    map.on('overlayremove', function(e) {
+        if (e.layer === casesLayer && riskLayer && map.hasLayer(riskLayer)) {
+            legendMode = 'risk';
+            legend.update();
+        } else if (e.layer === riskLayer && casesLayer && map.hasLayer(casesLayer)) {
+            legendMode = 'cases';
+            legend.update();
+        }
+    });
+
+    // ============================================================
+    // 比例尺
     // ============================================================
 
     L.control.scale({
